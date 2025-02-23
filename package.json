@@ -6,9 +6,11 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
   },
   "dependencies": {
-    "socket.io": "^4.7.0"
+    "socket.io": "^4.7.0",
+    "dotenv": "^16.4.1"
   }
 }
