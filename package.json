@@ -7,10 +7,13 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node server.mjs"
+    "dev": "nodemon server.mjs"
   },
   "dependencies": {
     "socket.io": "^4.7.0",
     "dotenv": "^16.4.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
   }
 }
