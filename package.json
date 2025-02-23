@@ -1,0 +1,14 @@
+{
+  "name": "multi-tic-tac-toe-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.0"
+  }
+}
