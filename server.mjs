@@ -3,14 +3,20 @@ import { Server } from 'socket.io';
 import 'dotenv/config';
 
 const httpServer = createServer();
+
+// Remove any trailing slashes from FRONTEND_URL
+const frontendUrl = process.env.FRONTEND_URL?.replace(/\/$/, '');
+
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.NODE_ENV === 'production' 
-      ? process.env.FRONTEND_URL 
-      : "http://localhost:5173",
-    methods: ["GET", "POST"]
+    origin: frontendUrl || "http://localhost:5173",
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
+
+// Log the CORS origin for debugging
+console.log('CORS origin:', frontendUrl || "http://localhost:5173");
 
 const getInitialGameState = () => ({
   cells: Array(3).fill(null).map(() => Array(3).fill({ value: '' })),
