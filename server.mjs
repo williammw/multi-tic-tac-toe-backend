@@ -5,7 +5,11 @@ import 'dotenv/config';
 const httpServer = createServer();
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    // Update this to include both your local and production domains
+    origin: [
+      process.env.FRONTEND_URL || "http://localhost:5173",
+      "https://www.idoitjustforfun.com"
+    ],
     methods: ["GET", "POST"],
     credentials: true
   }
