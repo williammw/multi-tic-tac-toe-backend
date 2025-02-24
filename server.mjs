@@ -41,11 +41,47 @@ class GameRoom {
   }
 
   removePlayer(playerId) {
+    console.log('Removing player:', playerId);
+    console.log('Current room state:', {
+      players: Array.from(this.players.entries()),
+      status: this.status,
+      state: this.state
+    });
+
+    const player = this.players.get(playerId);
+    console.log('Found player to remove:', player);
+    
     this.players.delete(playerId);
-    if (this.players.size === 0) {
+    console.log('Players after deletion:', Array.from(this.players.entries()));
+    
+    // If game was in progress, automatically update game state
+    if (this.status === 'playing' && this.players.size === 1) {
+      console.log('Game was in progress, updating state for remaining player');
+      const remainingPlayer = Array.from(this.players.values())[0];
+      console.log('Remaining player:', remainingPlayer);
+      
+      this.state = {
+        ...this.state,
+        gameOver: true,
+        winner: remainingPlayer.symbol,
+        cells: this.state.cells,  // Preserve the current board state
+        currentPlayer: remainingPlayer.symbol
+      };
       this.status = 'finished';
+      console.log('Updated game state:', this.state);
+    } else if (this.players.size === 0) {
+      console.log('No players remaining, resetting game state');
+      this.status = 'finished';
+      this.state = this.getInitialGameState();
     }
+    
     this.updateActivity();
+    const result = {
+      player,
+      remainingPlayer: this.players.size === 1 ? Array.from(this.players.values())[0] : null
+    };
+    console.log('RemovePlayer result:', result);
+    return result;
   }
 
   isReady() {
@@ -217,7 +253,7 @@ io.on('connection', (socket) => {
   // Handle game moves
   socket.on('make-move', ({ roomId, move }) => {
     try {
-      console.log('Received move:', { roomId, move, playerId: socket.id });
+      // console.log('Received move:', { roomId, move, playerId: socket.id });
       
       const room = matchmaking.getRoom(roomId);
       if (!room) {
@@ -290,21 +326,88 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle disconnection
-  socket.on('disconnect', () => {
+  // Handle player intentionally leaving game
+  socket.on('leave-game', ({ roomId, intentional }) => {
     try {
-      const roomId = matchmaking.removePlayer(socket.id);
-      if (roomId) {
-        const room = matchmaking.getRoom(roomId);
-        if (room) {
-          io.to(roomId).emit('player-left', {
-            playerId: socket.id,
-            gameState: room.getInitialGameState()
-          });
+      console.log('Player intentionally leaving:', socket.id, roomId);
+      const room = matchmaking.getRoom(roomId);
+      if (room) {
+        const { player, remainingPlayer } = room.removePlayer(socket.id);
+        
+        // Emit updated game state and player info
+        io.to(roomId).emit('player-left', {
+          playerId: socket.id,
+          gameState: room.state,
+          remainingPlayers: Array.from(room.players.entries()),
+          gameStatus: room.status,
+          reason: 'left',
+          leftPlayer: player,
+          remainingPlayer: remainingPlayer,
+          intentional: true
+        });
+
+        // Clean up empty rooms
+        if (room.players.size === 0) {
+          matchmaking.rooms.delete(roomId);
         }
       }
     } catch (error) {
+      console.error('Error in leave-game handler:', error);
+    }
+  });
+
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    try {
+      console.log('Player disconnected:', socket.id);
+      let disconnectedRoomId = null;
+      // Find the room the player was in
+      for (const [roomId, room] of matchmaking.rooms) {
+        if (room.players.has(socket.id)) {
+          disconnectedRoomId = roomId;
+          console.log('Found player\'s room:', roomId);
+          break;
+        }
+      }
+
+      if (disconnectedRoomId) {
+        const room = matchmaking.getRoom(disconnectedRoomId);
+        console.log('Room before player removal:', {
+          players: Array.from(room.players.entries()),
+          status: room.status,
+          state: room.state
+        });
+
+        if (room) {
+          const { player, remainingPlayer } = room.removePlayer(socket.id);
+          console.log('Player removal result:', { player, remainingPlayer });
+          
+          const eventData = {
+            playerId: socket.id,
+            gameState: room.state,
+            remainingPlayers: Array.from(room.players.entries()),
+            gameStatus: room.status,
+            reason: 'disconnect',
+            leftPlayer: player,
+            remainingPlayer: remainingPlayer
+          };
+          console.log('Emitting player-left event:', eventData);
+          
+          // Emit updated game state and player info
+          io.to(disconnectedRoomId).emit('player-left', eventData);
+
+          // Clean up empty rooms
+          if (room.players.size === 0) {
+            console.log('Removing empty room:', disconnectedRoomId);
+            matchmaking.rooms.delete(disconnectedRoomId);
+          }
+        }
+      } else {
+        console.log('Could not find room for disconnected player:', socket.id);
+      }
+    } catch (error) {
       console.error('Error in disconnect handler:', error);
+      console.error('Error stack:', error.stack);
     }
   });
 });
