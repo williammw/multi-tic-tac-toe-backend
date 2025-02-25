@@ -306,58 +306,136 @@ class GameRoom {
     return Date.now() - this.lastActivity > this.maxInactivityTime;
   }
 
-  validateMove(move, playerId) {
-    const player = this.getPlayerData(playerId);
-    
-    if (!player) {
-      console.log('Invalid move: Player not found');
-      return false;
+  // Updated server validateMove function for GameRoom class
+validateMove(move, playerId) {
+  const player = this.getPlayerData(playerId);
+  
+  if (!player) {
+    console.log('Invalid move: Player not found');
+    return false;
+  }
+  if (this.status !== 'playing') {
+    console.log('Invalid move: Game not in playing state');
+    return false;
+  }
+  if (move.currentPlayer !== player.symbol) {
+    console.log('Invalid move: Wrong player turn');
+    return false;
+  }
+  
+  // Get previous state for comparison
+  const prevState = this.state;
+  
+  // Find marks in both states
+  const prevMarks = [];
+  const newMarks = [];
+  
+  // Find marks in previous state
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      if (prevState.cells[i][j].value === player.symbol) {
+        prevMarks.push({
+          row: i,
+          col: j,
+          timestamp: prevState.cells[i][j].timestamp || 0
+        });
+      }
+      
+      if (move.cells[i][j].value === player.symbol) {
+        newMarks.push({
+          row: i,
+          col: j,
+          timestamp: move.cells[i][j].timestamp || 0
+        });
+      }
     }
-    if (this.status !== 'playing') {
-      console.log('Invalid move: Game not in playing state');
-      return false;
-    }
-    if (move.currentPlayer !== player.symbol) {
-      console.log('Invalid move: Wrong player turn');
-      return false;
-    }
+  }
+  
+  console.log('Previous marks:', prevMarks);
+  console.log('New marks:', newMarks);
+  
+  // Count changes
+  const prevCount = prevMarks.length;
+  const newCount = newMarks.length;
+  
+  console.log(`Previous count: ${prevCount}, New count: ${newCount}`);
+  
+  // If placing a 4th mark, we must remove one and add one
+  if (prevCount >= 3 && newCount === 3) {
+    console.log('Player had 3+ marks and still has 3, checking removal pattern');
     
-    // Add more validation logic here, e.g., ensuring only valid cells are changed
-    // Compare with previous state to ensure only valid changes were made
-    const prevState = this.state;
+    // Must have added one and removed one mark
+    let removedFound = false;
+    let addedFound = false;
     
-    // Make sure only one cell has changed
-    let changedCells = 0;
-    for (let i = 0; i < 3; i++) {
-      for (let j = 0; j < 3; j++) {
-        if (prevState.cells[i][j].value !== move.cells[i][j].value) {
-          changedCells++;
-          // Make sure the changed cell is valid (empty → player's symbol)
-          if (prevState.cells[i][j].value !== '' || move.cells[i][j].value !== player.symbol) {
-            console.log('Invalid move: Illegal cell modification');
-            return false;
-          }
+    // Check which mark was removed
+    for (const prevMark of prevMarks) {
+      let stillExists = false;
+      for (const newMark of newMarks) {
+        if (prevMark.row === newMark.row && prevMark.col === newMark.col) {
+          stillExists = true;
+          break;
         }
       }
+      if (!stillExists) {
+        removedFound = true;
+        console.log('Found removed mark at:', prevMark);
+      }
     }
     
-    // Check if player already has 3 marks and had to remove one
-    const prevCount = prevState.cells.flat().filter(cell => cell.value === player.symbol).length;
-    const newCount = move.cells.flat().filter(cell => cell.value === player.symbol).length;
-    
-    if (prevCount === 3 && newCount === 3) {
-      // The player should have removed one mark and added one
-      if (changedCells !== 2) {
-        console.log('Invalid move: Should remove one mark when placing a fourth');
-        return false;
+    // Check if a new mark was added
+    for (const newMark of newMarks) {
+      let existedBefore = false;
+      for (const prevMark of prevMarks) {
+        if (newMark.row === prevMark.row && newMark.col === prevMark.col) {
+          existedBefore = true;
+          break;
+        }
       }
-    } else if (changedCells !== 1) {
-      console.log('Invalid move: Should only change one cell');
+      if (!existedBefore) {
+        addedFound = true;
+        console.log('Found added mark at:', newMark);
+      }
+    }
+    
+    // If we didn't find both an added and removed mark, the move is invalid
+    if (!removedFound || !addedFound) {
+      console.log('Invalid move: When placing a 4th mark, must remove oldest and add new one');
       return false;
     }
     
     return true;
+  } 
+  // If just adding a mark normally (<= 3 total)
+  else if (newCount === prevCount + 1 && newCount <= 3) {
+    console.log('Player adding a new mark normally');
+    
+    // Make sure only one cell was added
+    let addedCount = 0;
+    for (const newMark of newMarks) {
+      let existedBefore = false;
+      for (const prevMark of prevMarks) {
+        if (newMark.row === prevMark.row && newMark.col === prevMark.col) {
+          existedBefore = true;
+          break;
+        }
+      }
+      if (!existedBefore) {
+        addedCount++;
+      }
+    }
+    
+    if (addedCount !== 1) {
+      console.log('Invalid move: Should add exactly one mark');
+      return false;
+    }
+    
+    return true;
+  } else {
+    console.log('Invalid move: Unexpected mark count change');
+    return false;
   }
+}
 
   startTurnTimer(io) {
     // Clear any existing timer
