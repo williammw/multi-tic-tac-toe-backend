@@ -25,15 +25,26 @@ class GameRoom {
     this.createdAt = Date.now();
     this.lastActivity = Date.now();
     this.maxInactivityTime = 5 * 60 * 1000; // 5 minutes
+    this.turnTimer = null;
+    this.turnTimeLimit = 10000; // 10 seconds per turn
+    this.turnStartTime = null;
   }
 
   getInitialGameState() {
+    // Randomly select the first player
+    const firstPlayer = Math.random() < 0.5 ? 'X' : 'O';
     return {
       cells: Array(3).fill(null).map(() => Array(3).fill({ value: '' })),
-      currentPlayer: 'X',
+      currentPlayer: firstPlayer,
       gameOver: false,
       winner: null
     };
+  }
+
+  performCoinToss() {
+    const firstPlayer = Math.random() < 0.5 ? 'X' : 'O';
+    this.state.currentPlayer = firstPlayer;
+    return firstPlayer;
   }
 
   addPlayer(playerId, playerData) {
@@ -57,6 +68,9 @@ class GameRoom {
     
     this.players.delete(playerId);
     console.log('Players after deletion:', Array.from(this.players.entries()));
+    
+    // Clear the turn timer when a player leaves
+    this.clearTurnTimer();
     
     // If game was in progress, automatically update game state
     if (this.status === 'playing' && this.players.size === 1) {
@@ -127,6 +141,165 @@ class GameRoom {
       return false;
     }
     return true;
+  }
+
+  startTurnTimer(io) {
+    // Clear any existing timer
+    this.clearTurnTimer();
+    
+    // Set the turn start time
+    this.turnStartTime = Date.now();
+    
+    // Emit the turn start event with time information
+    io.to(this.id).emit('turn-timer-start', {
+      startTime: this.turnStartTime,
+      duration: this.turnTimeLimit,
+      currentPlayer: this.state.currentPlayer
+    });
+    
+    // Set a timeout for the turn
+    this.turnTimer = setTimeout(() => {
+      this.handleTurnTimeout(io);
+    }, this.turnTimeLimit);
+  }
+  
+  clearTurnTimer() {
+    if (this.turnTimer) {
+      clearTimeout(this.turnTimer);
+      this.turnTimer = null;
+    }
+  }
+  
+  handleTurnTimeout(io) {
+    console.log(`Turn timeout for player ${this.state.currentPlayer} in room ${this.id}`);
+    
+    // Only process timeout if game is still playing
+    if (this.status !== 'playing' || this.state.gameOver) {
+      return;
+    }
+    
+    // Make a random move for the current player
+    this.makeRandomMove(io);
+  }
+  
+  makeRandomMove(io) {
+    // Find all empty cells
+    const emptyCells = [];
+    this.state.cells.forEach((row, rowIndex) => {
+      row.forEach((cell, colIndex) => {
+        if (!cell.value) {
+          emptyCells.push({ row: rowIndex, col: colIndex });
+        }
+      });
+    });
+    
+    // If no empty cells, game is a draw
+    if (emptyCells.length === 0) {
+      this.state.gameOver = true;
+      this.status = 'finished';
+      io.to(this.id).emit('game-state', this.state);
+      return;
+    }
+    
+    // Select a random empty cell
+    const randomIndex = Math.floor(Math.random() * emptyCells.length);
+    const { row, col } = emptyCells[randomIndex];
+    
+    // Get current player
+    const currentPlayerSymbol = this.state.currentPlayer;
+    
+    // Get player data for the current player
+    const currentPlayer = Array.from(this.players.values()).find(
+      player => player.symbol === currentPlayerSymbol
+    );
+    
+    // Create a copy of the cells
+    const newCells = this.state.cells.map(r => r.map(c => ({ ...c })));
+    
+    // For tic-tac-toe with 3 marks per player, check if we need to remove the oldest mark
+    const countMarks = (symbol) => {
+      return newCells.flat().filter(cell => cell.value === symbol).length;
+    };
+    
+    const getOldestMark = (symbol) => {
+      let oldest = { timestamp: Infinity, pos: null };
+      
+      newCells.forEach((row, i) => {
+        row.forEach((cell, j) => {
+          if (cell.value === symbol && cell.timestamp && cell.timestamp < oldest.timestamp) {
+            oldest = { timestamp: cell.timestamp, pos: { row: i, col: j } };
+          }
+        });
+      });
+      
+      return oldest.pos;
+    };
+    
+    // Check if player already has 3 marks
+    if (countMarks(currentPlayerSymbol) >= 3) {
+      const oldestPos = getOldestMark(currentPlayerSymbol);
+      if (oldestPos) {
+        newCells[oldestPos.row][oldestPos.col] = { value: '' };
+      }
+    }
+    
+    // Add the new mark
+    newCells[row][col] = { value: currentPlayerSymbol, timestamp: Date.now() };
+    
+    // Check for a winner
+    const winner = this.checkWinner(newCells);
+    
+    // Update the state
+    const updatedState = {
+      cells: newCells,
+      currentPlayer: currentPlayerSymbol === 'X' ? 'O' : 'X',
+      gameOver: !!winner,
+      winner
+    };
+    
+    this.state = updatedState;
+    
+    // Emit the auto-move event
+    io.to(this.id).emit('auto-move', {
+      player: currentPlayer,
+      row,
+      col,
+      reason: 'timeout'
+    });
+    
+    // Emit the updated game state
+    io.to(this.id).emit('game-state', updatedState);
+    
+    // If game continues, start the next turn timer
+    if (!updatedState.gameOver) {
+      this.startTurnTimer(io);
+    }
+  }
+  
+  checkWinner(cells) {
+    // Check rows
+    for (let i = 0; i < 3; i++) {
+      if (cells[i][0].value && cells[i][0].value === cells[i][1].value && cells[i][1].value === cells[i][2].value) {
+        return cells[i][0].value;
+      }
+    }
+
+    // Check columns
+    for (let j = 0; j < 3; j++) {
+      if (cells[0][j].value && cells[0][j].value === cells[1][j].value && cells[1][j].value === cells[2][j].value) {
+        return cells[0][j].value;
+      }
+    }
+
+    // Check diagonals
+    if (cells[0][0].value && cells[0][0].value === cells[1][1].value && cells[1][1].value === cells[2][2].value) {
+      return cells[0][0].value;
+    }
+    if (cells[0][2].value && cells[0][2].value === cells[1][1].value && cells[1][1].value === cells[2][0].value) {
+      return cells[0][2].value;
+    }
+
+    return null;
   }
 }
 
@@ -241,10 +414,22 @@ io.on('connection', (socket) => {
 
       if (room.isReady()) {
         room.status = 'playing';
+        // Perform the coin toss
+        const firstPlayer = room.performCoinToss();
+        // Emit coin toss result first
+        io.to(room.id).emit('coin-toss', {
+          result: firstPlayer,
+          startingPlayer: Array.from(room.players.values()).find(player => player.symbol === firstPlayer)
+        });
+        
+        // Then emit game start
         io.to(room.id).emit('game-start', {
           gameState: room.state,
           players: Array.from(room.players.entries())
         });
+        
+        // Start the turn timer for the first move
+        room.startTurnTimer(io);
       } else {
         socket.emit('waiting-for-opponent');
       }
@@ -281,6 +466,9 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Clear the turn timer as the player made a move
+      room.clearTurnTimer();
+
       // Update the state and switch the current player
       const updatedState = {
         ...move,
@@ -290,6 +478,11 @@ io.on('connection', (socket) => {
       room.state = updatedState;
       room.updateActivity();
       io.to(roomId).emit('game-state', updatedState);
+      
+      // If the game isn't over, start the turn timer for the next player
+      if (!updatedState.gameOver) {
+        room.startTurnTimer(io);
+      }
     } catch (error) {
       console.error('Error in make-move:', error);
       socket.emit('error', 'Failed to process move');
@@ -320,10 +513,20 @@ io.on('connection', (socket) => {
       room.status = 'playing';
       room.updateActivity();
       
+      // Perform a coin toss for the rematch
+      const firstPlayer = room.performCoinToss();
+      io.to(roomId).emit('coin-toss', {
+        result: firstPlayer,
+        startingPlayer: Array.from(room.players.values()).find(player => player.symbol === firstPlayer)
+      });
+      
       io.to(roomId).emit('game-start', {
         gameState: room.state,
         players: Array.from(room.players.entries())
       });
+      
+      // Start the turn timer for the first move of the rematch
+      room.startTurnTimer(io);
     } catch (error) {
       console.error('Error in accept-rematch:', error);
       socket.emit('error', 'Failed to start rematch');
