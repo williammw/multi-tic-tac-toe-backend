@@ -360,52 +360,55 @@ validateMove(move, playerId) {
   
   console.log(`Previous count: ${prevCount}, New count: ${newCount}`);
   
-  // If placing a 4th mark, we must remove one and add one
+  // If placing a 4th mark, we need to handle replacement logic correctly
   if (prevCount >= 3 && newCount === 3) {
-    console.log('Player had 3+ marks and still has 3, checking removal pattern');
+    console.log('Player had 3+ marks and still has 3, checking replacement pattern');
     
-    // Must have added one and removed one mark
-    let removedFound = false;
-    let addedFound = false;
+    // Create maps of positions to timestamps for better comparison
+    const prevPosMap = new Map();
+    const newPosMap = new Map();
     
-    // Check which mark was removed
-    for (const prevMark of prevMarks) {
-      let stillExists = false;
-      for (const newMark of newMarks) {
-        if (prevMark.row === newMark.row && prevMark.col === newMark.col) {
-          stillExists = true;
-          break;
-        }
-      }
-      if (!stillExists) {
-        removedFound = true;
-        console.log('Found removed mark at:', prevMark);
+    for (const mark of prevMarks) {
+      prevPosMap.set(`${mark.row},${mark.col}`, mark.timestamp);
+    }
+    
+    for (const mark of newMarks) {
+      newPosMap.set(`${mark.row},${mark.col}`, mark.timestamp);
+    }
+    
+    // Check for positions that were removed or timestamps that changed
+    let replacementFound = false;
+    
+    // Look for removed positions
+    for (const [pos, time] of prevPosMap.entries()) {
+      if (!newPosMap.has(pos)) {
+        console.log('Found removed mark at:', pos);
+        replacementFound = true;
+        break;
+      } else if (newPosMap.get(pos) !== time) {
+        // Same position but different timestamp (valid replacement)
+        console.log('Found updated timestamp at:', pos);
+        replacementFound = true;
+        break;
       }
     }
     
-    // Check if a new mark was added
-    for (const newMark of newMarks) {
-      let existedBefore = false;
-      for (const prevMark of prevMarks) {
-        if (newMark.row === prevMark.row && newMark.col === prevMark.col) {
-          existedBefore = true;
-          break;
-        }
-      }
-      if (!existedBefore) {
-        addedFound = true;
-        console.log('Found added mark at:', newMark);
+    // Look for new positions
+    for (const pos of newPosMap.keys()) {
+      if (!prevPosMap.has(pos)) {
+        console.log('Found added mark at:', pos);
+        replacementFound = true;
+        break;
       }
     }
     
-    // If we didn't find both an added and removed mark, the move is invalid
-    if (!removedFound || !addedFound) {
-      console.log('Invalid move: When placing a 4th mark, must remove oldest and add new one');
+    if (!replacementFound) {
+      console.log('Invalid move: No replacement found');
       return false;
     }
     
     return true;
-  } 
+  }
   // If just adding a mark normally (<= 3 total)
   else if (newCount === prevCount + 1 && newCount <= 3) {
     console.log('Player adding a new mark normally');
