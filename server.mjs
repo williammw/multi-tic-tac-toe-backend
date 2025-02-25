@@ -1,19 +1,190 @@
 import { createServer } from 'node:http';
 import { Server } from 'socket.io';
 import 'dotenv/config';
+import admin from 'firebase-admin';
+import express from 'express';
+import { rateLimit } from 'express-rate-limit';
 
-const httpServer = createServer();
+// Initialize Firebase Admin SDK
+// Note: You'll need to obtain a service account key from Firebase console
+// and store it securely or use environment variables for the configuration
+try {
+  admin.initializeApp({
+    // If using a JSON file (for development):
+    // credential: admin.credential.cert('./service-account-key.json'),
+    
+    // For production, use environment variables:
+    credential: admin.credential.cert({
+      "type": process.env.FIREBASE_TYPE,
+      "project_id": process.env.FIREBASE_PROJECT_ID,
+      "private_key_id": process.env.FIREBASE_PRIVATE_KEY_ID,
+      "private_key": process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      "client_email": process.env.FIREBASE_CLIENT_EMAIL,
+      "client_id": process.env.FIREBASE_CLIENT_ID,
+      "auth_uri": process.env.FIREBASE_AUTH_URI,
+      "token_uri": process.env.FIREBASE_TOKEN_URI,
+      "auth_provider_x509_cert_url": process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
+      "client_x509_cert_url": process.env.FIREBASE_CLIENT_CERT_URL
+    })
+  });
+  console.log('Firebase Admin SDK initialized successfully');
+} catch (error) {
+  console.error('Error initializing Firebase Admin SDK:', error);
+}
+
+// Create express app for better middleware support
+const app = express();
+
+// Apply rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests, please try again later.'
+});
+
+app.use(limiter);
+
+// Create HTTP server with Express
+const httpServer = createServer(app);
+
+// Store active connections with their UID for tracking and security
+const activeConnections = new Map();
+
+// Create Socket.IO server with secure CORS configuration
 const io = new Server(httpServer, {
   cors: {
-    // Update this to include both your local and production domains
-    origin: [
-      process.env.FRONTEND_URL || "http://localhost:5173",
-      "https://www.idoitjustforfun.com"
-    ],
+    origin: process.env.NODE_ENV === 'production' 
+      ? [process.env.FRONTEND_URL, "https://www.idoitjustforfun.com"].filter(Boolean)
+      : process.env.FRONTEND_URL || "http://localhost:5173",
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: true,
+    allowedHeaders: ["Authorization"]
   }
 });
+
+// Socket.IO authentication middleware
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    
+    // If no token is provided, allow anonymous access but limit capabilities
+    if (!token) {
+      socket.user = { anonymous: true, id: socket.id };
+      // Store rate limiting data for anonymous users
+      socket.eventCount = {
+        timestamp: Date.now(),
+        count: 0
+      };
+      return next();
+    }
+    
+    // Verify Firebase token
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    
+    // Set authenticated user data on socket
+    socket.user = {
+      uid: decodedToken.uid,
+      email: decodedToken.email,
+      name: decodedToken.name,
+      anonymous: false
+    };
+    
+    // Track this connection with the user's ID
+    if (!activeConnections.has(decodedToken.uid)) {
+      activeConnections.set(decodedToken.uid, new Set());
+    }
+    activeConnections.get(decodedToken.uid).add(socket.id);
+    
+    next();
+  } catch (error) {
+    console.error('Authentication error:', error);
+    // Allow connection but mark as anonymous
+    socket.user = { anonymous: true, id: socket.id };
+    socket.eventCount = {
+      timestamp: Date.now(),
+      count: 0
+    };
+    next();
+  }
+});
+
+// Input validation functions
+function validateMoveData(move) {
+  if (!move || typeof move !== 'object') return false;
+  
+  // Validate the cells array structure
+  if (!Array.isArray(move.cells)) return false;
+  if (move.cells.length !== 3) return false;
+  
+  for (const row of move.cells) {
+    if (!Array.isArray(row) || row.length !== 3) return false;
+    for (const cell of row) {
+      if (typeof cell !== 'object') return false;
+      if (cell.value !== '' && cell.value !== 'X' && cell.value !== 'O') return false;
+    }
+  }
+  
+  // Validate other required fields
+  if (move.currentPlayer !== 'X' && move.currentPlayer !== 'O') return false;
+  if (typeof move.gameOver !== 'boolean') return false;
+  
+  // Winner can be null or X/O
+  if (move.winner !== null && move.winner !== 'X' && move.winner !== 'O') return false;
+  
+  return true;
+}
+
+function sanitizePlayerData(playerData) {
+  if (!playerData || typeof playerData !== 'object') {
+    return { name: 'Anonymous', avatar: null };
+  }
+  
+  // Sanitize player name
+  let name = typeof playerData.name === 'string' ? playerData.name.trim() : 'Anonymous';
+  
+  // Limit name length and strip any HTML
+  name = name.substring(0, 20).replace(/<[^>]*>?/gm, '');
+  
+  // Sanitize avatar URL if provided (could be enhanced with URL validation)
+  let avatar = null;
+  if (typeof playerData.avatar === 'string' && playerData.avatar.startsWith('https://')) {
+    avatar = playerData.avatar;
+  }
+  
+  return { name, avatar };
+}
+
+// Event rate limiting for socket events
+function checkRateLimit(socket, increment = true) {
+  // Skip for authenticated users
+  if (!socket.user.anonymous) return true;
+  
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 minute
+  
+  // Initialize or reset counters if window has expired
+  if (!socket.eventCount || now - socket.eventCount.timestamp > windowMs) {
+    socket.eventCount = {
+      timestamp: now,
+      count: increment ? 1 : 0
+    };
+    return true;
+  }
+  
+  // Check if limit exceeded
+  if (socket.eventCount.count >= 20) { // 20 events per minute for anonymous users
+    return false;
+  }
+  
+  // Increment counter if needed
+  if (increment) {
+    socket.eventCount.count++;
+  }
+  
+  return true;
+}
 
 // Game State Management
 class GameRoom {
@@ -28,6 +199,7 @@ class GameRoom {
     this.turnTimer = null;
     this.turnTimeLimit = 10000; // 10 seconds per turn
     this.turnStartTime = null;
+    this.moveHistory = []; // Track all moves for validation and replay
   }
 
   getInitialGameState() {
@@ -47,27 +219,38 @@ class GameRoom {
     return firstPlayer;
   }
 
-  addPlayer(playerId, playerData) {
+  addPlayer(playerId, playerData, userProfile = null) {
     if (this.players.size >= 2) return false;
+    
+    // Sanitize player data to prevent XSS
+    const sanitizedPlayerData = sanitizePlayerData(playerData);
+    
     const symbol = this.players.size === 0 ? 'X' : 'O';
-    this.players.set(playerId, { ...playerData, symbol });
+    
+    // Add authentication data if available
+    const playerInfo = {
+      ...sanitizedPlayerData,
+      symbol,
+      authenticated: !!userProfile,
+      uid: userProfile?.uid || null,
+      joinedAt: Date.now()
+    };
+    
+    this.players.set(playerId, playerInfo);
     this.updateActivity();
     return true;
   }
 
   removePlayer(playerId) {
     console.log('Removing player:', playerId);
-    console.log('Current room state:', {
-      players: Array.from(this.players.entries()),
-      status: this.status,
-      state: this.state
-    });
-
+    
     const player = this.players.get(playerId);
-    console.log('Found player to remove:', player);
+    if (!player) {
+      console.log('Player not found:', playerId);
+      return { player: null, remainingPlayer: null };
+    }
     
     this.players.delete(playerId);
-    console.log('Players after deletion:', Array.from(this.players.entries()));
     
     // Clear the turn timer when a player leaves
     this.clearTurnTimer();
@@ -76,7 +259,6 @@ class GameRoom {
     if (this.status === 'playing' && this.players.size === 1) {
       console.log('Game was in progress, updating state for remaining player');
       const remainingPlayer = Array.from(this.players.values())[0];
-      console.log('Remaining player:', remainingPlayer);
       
       this.state = {
         ...this.state,
@@ -86,7 +268,14 @@ class GameRoom {
         currentPlayer: remainingPlayer.symbol
       };
       this.status = 'finished';
-      console.log('Updated game state:', this.state);
+      
+      // Add to move history
+      this.moveHistory.push({
+        type: 'player_left',
+        playerId,
+        resulting_state: { ...this.state },
+        timestamp: Date.now()
+      });
     } else if (this.players.size === 0) {
       console.log('No players remaining, resetting game state');
       this.status = 'finished';
@@ -98,7 +287,6 @@ class GameRoom {
       player,
       remainingPlayer: this.players.size === 1 ? Array.from(this.players.values())[0] : null
     };
-    console.log('RemovePlayer result:', result);
     return result;
   }
 
@@ -120,13 +308,6 @@ class GameRoom {
 
   validateMove(move, playerId) {
     const player = this.getPlayerData(playerId);
-    console.log('Validating move:', {
-      move,
-      playerId,
-      player,
-      roomStatus: this.status,
-      currentPlayer: move.currentPlayer
-    });
     
     if (!player) {
       console.log('Invalid move: Player not found');
@@ -140,6 +321,41 @@ class GameRoom {
       console.log('Invalid move: Wrong player turn');
       return false;
     }
+    
+    // Add more validation logic here, e.g., ensuring only valid cells are changed
+    // Compare with previous state to ensure only valid changes were made
+    const prevState = this.state;
+    
+    // Make sure only one cell has changed
+    let changedCells = 0;
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        if (prevState.cells[i][j].value !== move.cells[i][j].value) {
+          changedCells++;
+          // Make sure the changed cell is valid (empty → player's symbol)
+          if (prevState.cells[i][j].value !== '' || move.cells[i][j].value !== player.symbol) {
+            console.log('Invalid move: Illegal cell modification');
+            return false;
+          }
+        }
+      }
+    }
+    
+    // Check if player already has 3 marks and had to remove one
+    const prevCount = prevState.cells.flat().filter(cell => cell.value === player.symbol).length;
+    const newCount = move.cells.flat().filter(cell => cell.value === player.symbol).length;
+    
+    if (prevCount === 3 && newCount === 3) {
+      // The player should have removed one mark and added one
+      if (changedCells !== 2) {
+        console.log('Invalid move: Should remove one mark when placing a fourth');
+        return false;
+      }
+    } else if (changedCells !== 1) {
+      console.log('Invalid move: Should only change one cell');
+      return false;
+    }
+    
     return true;
   }
 
@@ -197,6 +413,14 @@ class GameRoom {
     if (emptyCells.length === 0) {
       this.state.gameOver = true;
       this.status = 'finished';
+      
+      // Add to move history
+      this.moveHistory.push({
+        type: 'game_draw',
+        resulting_state: { ...this.state },
+        timestamp: Date.now()
+      });
+      
       io.to(this.id).emit('game-state', this.state);
       return;
     }
@@ -236,9 +460,11 @@ class GameRoom {
     };
     
     // Check if player already has 3 marks
+    let removedMarkPos = null;
     if (countMarks(currentPlayerSymbol) >= 3) {
       const oldestPos = getOldestMark(currentPlayerSymbol);
       if (oldestPos) {
+        removedMarkPos = oldestPos;
         newCells[oldestPos.row][oldestPos.col] = { value: '' };
       }
     }
@@ -256,6 +482,17 @@ class GameRoom {
       gameOver: !!winner,
       winner
     };
+    
+    // Add to move history
+    this.moveHistory.push({
+      type: 'auto_move',
+      player: currentPlayerSymbol,
+      row,
+      col,
+      removed_mark: removedMarkPos,
+      resulting_state: { ...updatedState },
+      timestamp: Date.now()
+    });
     
     this.state = updatedState;
     
@@ -301,6 +538,20 @@ class GameRoom {
 
     return null;
   }
+  
+  recordMove(playerId, move) {
+    const player = this.getPlayerData(playerId);
+    if (!player) return;
+    
+    // Create a move record for the history
+    this.moveHistory.push({
+      type: 'player_move',
+      playerId,
+      playerSymbol: player.symbol,
+      resulting_state: { ...move },
+      timestamp: Date.now()
+    });
+  }
 }
 
 // Matchmaking System
@@ -327,17 +578,18 @@ class MatchmakingSystem {
   }
 
   createRoom() {
-    const roomId = `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // Generate a secure room ID
+    const roomId = `room_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
     const room = new GameRoom(roomId);
     this.rooms.set(roomId, room);
     return room;
   }
 
-  findOrCreateRoom(playerId, playerData) {
+  findOrCreateRoom(playerId, playerData, userProfile = null) {
     // Try to find an existing waiting room
     for (const [roomId, room] of this.rooms) {
       if (room.status === 'waiting' && !room.isReady()) {
-        if (room.addPlayer(playerId, playerData)) {
+        if (room.addPlayer(playerId, playerData, userProfile)) {
           return room;
         }
       }
@@ -345,7 +597,7 @@ class MatchmakingSystem {
 
     // Create a new room if no suitable room found
     const newRoom = this.createRoom();
-    newRoom.addPlayer(playerId, playerData);
+    newRoom.addPlayer(playerId, playerData, userProfile);
     return newRoom;
   }
 
@@ -353,14 +605,14 @@ class MatchmakingSystem {
     this.waitingPlayers.delete(playerId);
     for (const [roomId, room] of this.rooms) {
       if (room.players.has(playerId)) {
-        room.removePlayer(playerId);
+        const result = room.removePlayer(playerId);
         if (room.status === 'finished') {
           this.rooms.delete(roomId);
         }
-        return roomId;
+        return { roomId, ...result };
       }
     }
-    return null;
+    return { roomId: null, player: null, remainingPlayer: null };
   }
 
   getRoom(roomId) {
@@ -379,30 +631,84 @@ const matchmaking = new MatchmakingSystem();
 
 // Socket.IO event handlers
 io.on('connection', (socket) => {
-  console.log('Player connected:', socket.id);
+  console.log('Player connected:', socket.id, socket.user?.anonymous ? '(anonymous)' : '(authenticated)');
 
-  // Handle reconnection
-  socket.on('reconnect-game', ({ roomId, playerSymbol }) => {
-    const room = matchmaking.reconnectPlayer(socket.id, roomId);
-    if (room) {
-      socket.join(roomId);
-      socket.emit('game-state', room.state);
-      socket.emit('room-joined', {
-        roomId,
-        players: Array.from(room.players.entries()),
-        playerSymbol
-      });
+  // Handle reconnection with authentication
+  socket.on('reconnect-game', ({ roomId, playerSymbol, token }) => {
+    try {
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
+      // If token is provided, verify it
+      if (token) {
+        admin.auth().verifyIdToken(token)
+          .then(decodedToken => {
+            socket.user = {
+              uid: decodedToken.uid,
+              email: decodedToken.email,
+              name: decodedToken.name,
+              anonymous: false
+            };
+            
+            // Track this connection
+            if (!activeConnections.has(decodedToken.uid)) {
+              activeConnections.set(decodedToken.uid, new Set());
+            }
+            activeConnections.get(decodedToken.uid).add(socket.id);
+            
+            // Now reconnect to the game room
+            handleReconnection(roomId, playerSymbol);
+          })
+          .catch(error => {
+            console.error('Token verification error:', error);
+            socket.emit('error', 'Authentication failed');
+          });
+      } else {
+        // Handle anonymous reconnection
+        handleReconnection(roomId, playerSymbol);
+      }
+      
+      function handleReconnection(roomId, playerSymbol) {
+        const room = matchmaking.reconnectPlayer(socket.id, roomId);
+        if (room) {
+          socket.join(roomId);
+          socket.emit('game-state', room.state);
+          socket.emit('room-joined', {
+            roomId,
+            players: Array.from(room.players.entries()),
+            playerSymbol
+          });
+        } else {
+          socket.emit('error', 'Room not found');
+        }
+      }
+    } catch (error) {
+      console.error('Error in reconnect-game:', error);
+      socket.emit('error', 'Failed to reconnect to game');
     }
   });
 
-  // Handle matchmaking
+  // Handle matchmaking with authentication
   socket.on('join-matchmaking', (playerData = {}) => {
     try {
-      const room = matchmaking.findOrCreateRoom(socket.id, {
-        name: playerData.name || `Player_${socket.id.substr(0, 4)}`,
-        avatar: playerData.avatar,
-        joinedAt: Date.now()
-      });
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
+      // Sanitize player data to prevent XSS
+      const sanitizedPlayerData = sanitizePlayerData(playerData);
+      
+      // Create or find a room for the player
+      const room = matchmaking.findOrCreateRoom(
+        socket.id, 
+        sanitizedPlayerData,
+        socket.user?.anonymous ? null : socket.user
+      );
 
       socket.join(room.id);
       
@@ -416,6 +722,15 @@ io.on('connection', (socket) => {
         room.status = 'playing';
         // Perform the coin toss
         const firstPlayer = room.performCoinToss();
+        
+        // Add to move history
+        room.moveHistory.push({
+          type: 'game_start',
+          players: Array.from(room.players.entries()),
+          first_player: firstPlayer,
+          timestamp: Date.now()
+        });
+        
         // Emit coin toss result first
         io.to(room.id).emit('coin-toss', {
           result: firstPlayer,
@@ -439,10 +754,20 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle game moves
+  // Handle game moves with validation
   socket.on('make-move', ({ roomId, move }) => {
     try {
-      // console.log('Received move:', { roomId, move, playerId: socket.id });
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
+      // Validate move data structure
+      if (!validateMoveData(move)) {
+        socket.emit('error', 'Invalid move data structure');
+        return;
+      }
       
       const room = matchmaking.getRoom(roomId);
       if (!room) {
@@ -450,19 +775,28 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Verify the player is in this room
       const player = room.getPlayerData(socket.id);
       if (!player) {
-        socket.emit('error', 'Player not found');
+        socket.emit('error', 'Player not found in this room');
         return;
       }
-
+      
+      // Check game state
       if (room.status !== 'playing') {
         socket.emit('error', 'Game not in progress');
         return;
       }
 
+      // Check if it's this player's turn
       if (room.state.currentPlayer !== player.symbol) {
         socket.emit('error', 'Not your turn');
+        return;
+      }
+      
+      // Validate the move against the current game state
+      if (!room.validateMove(move, socket.id)) {
+        socket.emit('error', 'Invalid move');
         return;
       }
 
@@ -474,6 +808,9 @@ io.on('connection', (socket) => {
         ...move,
         currentPlayer: player.symbol === 'X' ? 'O' : 'X'
       };
+      
+      // Record this move in history
+      room.recordMove(socket.id, updatedState);
 
       room.state = updatedState;
       room.updateActivity();
@@ -492,8 +829,23 @@ io.on('connection', (socket) => {
   // Handle rematch requests
   socket.on('request-rematch', (roomId) => {
     try {
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
       const room = matchmaking.getRoom(roomId);
-      if (!room) return;
+      if (!room) {
+        socket.emit('error', 'Room not found');
+        return;
+      }
+      
+      // Verify the player is in this room
+      if (!room.getPlayerData(socket.id)) {
+        socket.emit('error', 'Player not found in this room');
+        return;
+      }
 
       room.updateActivity();
       socket.to(roomId).emit('rematch-requested', socket.id);
@@ -506,15 +858,44 @@ io.on('connection', (socket) => {
   // Handle rematch acceptance
   socket.on('accept-rematch', (roomId) => {
     try {
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
       const room = matchmaking.getRoom(roomId);
-      if (!room) return;
+      if (!room) {
+        socket.emit('error', 'Room not found');
+        return;
+      }
+      
+      // Verify the player is in this room
+      if (!room.getPlayerData(socket.id)) {
+        socket.emit('error', 'Player not found in this room');
+        return;
+      }
 
       room.state = room.getInitialGameState();
       room.status = 'playing';
       room.updateActivity();
       
+      // Add to move history
+      room.moveHistory.push({
+        type: 'rematch',
+        timestamp: Date.now()
+      });
+      
       // Perform a coin toss for the rematch
       const firstPlayer = room.performCoinToss();
+      
+      // Add to move history
+      room.moveHistory.push({
+        type: 'coin_toss',
+        result: firstPlayer,
+        timestamp: Date.now()
+      });
+      
       io.to(roomId).emit('coin-toss', {
         result: firstPlayer,
         startingPlayer: Array.from(room.players.values()).find(player => player.symbol === firstPlayer)
@@ -536,27 +917,42 @@ io.on('connection', (socket) => {
   // Handle player intentionally leaving game
   socket.on('leave-game', ({ roomId, intentional }) => {
     try {
+      // Check rate limiting for anonymous users
+      if (!checkRateLimit(socket)) {
+        socket.emit('error', 'Rate limit exceeded');
+        return;
+      }
+      
       console.log('Player intentionally leaving:', socket.id, roomId);
       const room = matchmaking.getRoom(roomId);
-      if (room) {
-        const { player, remainingPlayer } = room.removePlayer(socket.id);
-        
-        // Emit updated game state and player info
-        io.to(roomId).emit('player-left', {
-          playerId: socket.id,
-          gameState: room.state,
-          remainingPlayers: Array.from(room.players.entries()),
-          gameStatus: room.status,
-          reason: 'left',
-          leftPlayer: player,
-          remainingPlayer: remainingPlayer,
-          intentional: true
-        });
+      if (!room) {
+        socket.emit('error', 'Room not found');
+        return;
+      }
+      
+      // Verify the player is in this room
+      if (!room.getPlayerData(socket.id)) {
+        socket.emit('error', 'Player not found in this room');
+        return;
+      }
+      
+      const { player, remainingPlayer } = room.removePlayer(socket.id);
+      
+      // Emit updated game state and player info
+      io.to(roomId).emit('player-left', {
+        playerId: socket.id,
+        gameState: room.state,
+        remainingPlayers: Array.from(room.players.entries()),
+        gameStatus: room.status,
+        reason: 'left',
+        leftPlayer: player,
+        remainingPlayer: remainingPlayer,
+        intentional: true
+      });
 
-        // Clean up empty rooms
-        if (room.players.size === 0) {
-          matchmaking.rooms.delete(roomId);
-        }
+      // Clean up empty rooms
+      if (room.players.size === 0) {
+        matchmaking.rooms.delete(roomId);
       }
     } catch (error) {
       console.error('Error in leave-game handler:', error);
@@ -567,28 +963,24 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     try {
       console.log('Player disconnected:', socket.id);
-      let disconnectedRoomId = null;
-      // Find the room the player was in
-      for (const [roomId, room] of matchmaking.rooms) {
-        if (room.players.has(socket.id)) {
-          disconnectedRoomId = roomId;
-          console.log('Found player\'s room:', roomId);
-          break;
+      
+      // Clean up authentication tracking if this was an authenticated user
+      if (socket.user && !socket.user.anonymous) {
+        const uid = socket.user.uid;
+        if (activeConnections.has(uid)) {
+          activeConnections.get(uid).delete(socket.id);
+          if (activeConnections.get(uid).size === 0) {
+            activeConnections.delete(uid);
+          }
         }
       }
-
-      if (disconnectedRoomId) {
-        const room = matchmaking.getRoom(disconnectedRoomId);
-        console.log('Room before player removal:', {
-          players: Array.from(room.players.entries()),
-          status: room.status,
-          state: room.state
-        });
-
+      
+      // Handle game room cleanup
+      const { roomId, player, remainingPlayer } = matchmaking.removePlayer(socket.id);
+      
+      if (roomId) {
+        const room = matchmaking.getRoom(roomId);
         if (room) {
-          const { player, remainingPlayer } = room.removePlayer(socket.id);
-          console.log('Player removal result:', { player, remainingPlayer });
-          
           const eventData = {
             playerId: socket.id,
             gameState: room.state,
@@ -598,24 +990,30 @@ io.on('connection', (socket) => {
             leftPlayer: player,
             remainingPlayer: remainingPlayer
           };
-          console.log('Emitting player-left event:', eventData);
           
           // Emit updated game state and player info
-          io.to(disconnectedRoomId).emit('player-left', eventData);
+          io.to(roomId).emit('player-left', eventData);
 
           // Clean up empty rooms
           if (room.players.size === 0) {
-            console.log('Removing empty room:', disconnectedRoomId);
-            matchmaking.rooms.delete(disconnectedRoomId);
+            console.log('Removing empty room:', roomId);
+            matchmaking.rooms.delete(roomId);
           }
         }
-      } else {
-        console.log('Could not find room for disconnected player:', socket.id);
       }
     } catch (error) {
       console.error('Error in disconnect handler:', error);
       console.error('Error stack:', error.stack);
     }
+  });
+});
+
+// Security related reporting routes
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: Date.now()
   });
 });
 
@@ -631,5 +1029,5 @@ process.on('unhandledRejection', (reason, promise) => {
 // Start the server
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Secure server running on port ${PORT}`);
 });
